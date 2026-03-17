@@ -242,6 +242,18 @@ class AcceleratorConfig:
         default=False,
         metadata={"help": "Enable expert parallelism outside in ep-fsdp."},
     )
+    extra_parallel_sizes: List[int] = field(
+        default_factory=list,
+        metadata={"help": "Extra parallelism sizes."},
+    )
+    extra_parallel_placement_innermost: List[bool] = field(
+        default_factory=list,
+        metadata={"help": "Extra parallelism outside in para-fsdp."},
+    )
+    extra_parallel_names: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Extra parallelism names."},
+    )
     pp_size: int = field(
         default=1,
         metadata={"help": "Pipeline parallel size."},
@@ -260,6 +272,12 @@ class AcceleratorConfig:
     )
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     offload_config: OffloadConfig = field(default_factory=OffloadConfig)
+
+    def __post_init__(self):
+        # configure extra parallelism to include expert parallelism
+        self.extra_parallel_sizes.append(self.ep_size)
+        self.extra_parallel_names.append("ep")
+        self.extra_parallel_placement_innermost.append(self.ep_outside)
 
 
 @dataclass
@@ -467,6 +485,13 @@ class TrainingArguments:
         )
         if acc.fsdp_config.fsdp_mode == "fsdp2":
             assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
+        else:
+            if self.broadcast_model_weights_from_rank0:
+                logger.warning_rank0(
+                    "Ignoring train.broadcast_model_weights_from_rank0=True because it is only "
+                    "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
+                    f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
+                )
 
     def _derive_batch_config(self):
         acc = self.accelerator
@@ -547,9 +572,13 @@ class OpsImplementationConfig:
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
     )
-    moe_implementation: Optional[Literal["eager", "fused"]] = field(
+    moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = field(
         default=None,
-        metadata={"help": "MoE implementation to use."},
+        metadata={
+            "help": "MoE implementation to use. "
+            "'eager' for reference loop, 'fused' for Triton group-gemm, "
+            "'fused_quack' for Quack CUTLASS/CuTe kernels (SM90+)."
+        },
     )
 
     def __post_init__(self):

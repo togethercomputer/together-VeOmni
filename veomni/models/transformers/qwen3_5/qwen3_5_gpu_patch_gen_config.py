@@ -18,22 +18,27 @@ Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config -o veomni/models/transformers/qwen3_5/generated --diff
 
 Language-model focused patches from qwen3_next example:
-1. Disable use_cache when gradient checkpointing is enabled.
-2. Slice RoPE position embeddings for sequence parallel.
+1. Device-agnostic GatedDeltaNet init and varlen FLA forward.
+2. DecoderLayer forward with cu_seq_lens_q passthrough.
 3. Use VeOmni fused loss path in Qwen3_5ForConditionalGeneration.forward.
 """
 
+from copy import copy
+from functools import partial
+from types import SimpleNamespace
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
-from transformers.masking_utils import create_causal_mask
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5Config,
     Qwen3_5DynamicCache,
+    Qwen3_5Model,
     Qwen3_5ModelOutputWithPast,
     Qwen3_5RMSNormGated,
     apply_mask_to_padding_states,
@@ -43,8 +48,9 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_position_embedding
-from veomni.patchgen.patch_spec import PatchConfig
+from veomni.distributed.sequence_parallel import sp_pad_and_slice
+from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
+from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 
 
@@ -57,9 +63,27 @@ config = PatchConfig(
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
 
+config.add_import("copy", names=["copy"])
+config.add_import("functools", names=["partial"])
+config.add_import("types", names=["SimpleNamespace"])
+config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_import("veomni.distributed.sequence_parallel", names=["slice_position_embedding"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
+config.add_import(
+    "veomni.distributed.sequence_parallel.ulysses",
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
+)
+config.patches.append(
+    create_patch_from_external(
+        target="Qwen3_5RMSNorm",
+        replacement_module="liger_kernel.transformers.rms_norm",
+        replacement_name="LigerRMSNormForQwen3Next",
+        description="Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)",
+    )
+)
+
+config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
+config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -82,8 +106,8 @@ config.add_post_import_block(
         FusedRMSNormGated = None
         causal_conv1d_update, causal_conv1d_fn = None, None
         logging.get_logger(__name__).warning(
-            "Failed to import FLA modules: fallback to eager implementation. "
-            "This case can't support rmpad_with_pos_ids=True!"
+            "Failed to import FLA modules: fallback to eager implementation."
+            "This case can't support dynamic batching packing!"
         )
     """
 )
@@ -101,6 +125,8 @@ torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for th
 fused_recurrent_gated_delta_rule = None
 torch_recurrent_gated_delta_rule = None
 is_fast_path_available = None
+gather_seq_scatter_heads = None
+gather_heads_scatter_seq = None
 
 
 @config.override_method(
@@ -175,8 +201,29 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
 
 
 @config.override_method(
+    "Qwen3_5GatedDeltaNet._get_local_conv1d_weight",
+    description="Shard depthwise conv1d weights for local heads under Ulysses SP",
+)
+def qwen3_5_gated_deltanet_get_local_conv1d_weight(
+    self, ulysses_rank: int, local_key_dim: int, local_value_dim: int
+) -> torch.Tensor:
+    # Modification: shard depthwise conv1d weights to match head-sharded mixed_qkv channels.
+    w_full = self.conv1d.weight.squeeze(1)
+    assert w_full.shape[0] == self.key_dim * 2 + self.value_dim, (
+        f"conv1d weight dim ({w_full.shape[0]}) must match "
+        f"(2 * key_dim + value_dim) ({self.key_dim * 2 + self.value_dim})"
+    )
+    k_off = ulysses_rank * local_key_dim
+    v_off = ulysses_rank * local_value_dim
+    w_q = w_full[k_off : k_off + local_key_dim]
+    w_k = w_full[self.key_dim + k_off : self.key_dim + k_off + local_key_dim]
+    w_v = w_full[2 * self.key_dim + v_off : 2 * self.key_dim + v_off + local_value_dim]
+    return torch.cat([w_q, w_k, w_v], dim=0)
+
+
+@config.override_method(
     "Qwen3_5GatedDeltaNet.forward",
-    description="Support varlen flash linear attention in Qwen3_5GatedDeltaNet.forward",
+    description="Support varlen flash linear attention and Ulysses SP in Qwen3_5GatedDeltaNet.forward",
 )
 def qwen3_5_gated_deltanet_forward_patched(
     self,
@@ -202,7 +249,6 @@ def qwen3_5_gated_deltanet_forward_patched(
         recurrent_state = cache_params.recurrent_states[self.layer_idx]
 
     mixed_qkv = self.in_proj_qkv(hidden_states)
-    mixed_qkv = mixed_qkv.transpose(1, 2)
 
     z = self.in_proj_z(hidden_states)
     z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
@@ -210,48 +256,103 @@ def qwen3_5_gated_deltanet_forward_patched(
     b = self.in_proj_b(hidden_states)
     a = self.in_proj_a(hidden_states)
 
+    # Modification: Ulysses SP all-to-all for linear attention heads.
+    ulysses_enabled = get_parallel_state().ulysses_enabled
+    if ulysses_enabled:
+        ulysses_group = get_parallel_state().ulysses_group
+        ulysses_size = get_parallel_state().ulysses_size
+        ulysses_rank = get_parallel_state().ulysses_rank
+        assert self.num_k_heads % ulysses_size == 0 and self.num_v_heads % ulysses_size == 0, (
+            f"SP size ({ulysses_size}) must divide num_k_heads ({self.num_k_heads}) "
+            f"and num_v_heads ({self.num_v_heads}) for gated deltanet LASP"
+        )
+
+        local_num_k_heads = self.num_k_heads // ulysses_size
+        local_num_v_heads = self.num_v_heads // ulysses_size
+        local_key_dim = self.head_k_dim * local_num_k_heads
+        local_value_dim = self.head_v_dim * local_num_v_heads
+
+        # Reshape mixed_qkv to head layout for all-to-all: [B, S_local, D] -> split+reshape to heads
+        q_proj, k_proj, v_proj = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q_proj = q_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        k_proj = k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        v_proj = v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+
+        # All-to-all: gather full sequence, scatter heads -> [B, S_full, local_heads, head_dim]
+        q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+        k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+        v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+
+        b = b.reshape(batch_size, seq_len, self.num_v_heads)
+        a = a.reshape(batch_size, seq_len, self.num_v_heads)
+        b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
+        a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
+
+        # Flatten heads back to channels and concat for conv1d: [B, S_full, local_dim]
+        q_proj = q_proj.reshape(q_proj.shape[0], q_proj.shape[1], -1)
+        k_proj = k_proj.reshape(k_proj.shape[0], k_proj.shape[1], -1)
+        v_proj = v_proj.reshape(v_proj.shape[0], v_proj.shape[1], -1)
+        mixed_qkv = torch.cat((q_proj, k_proj, v_proj), dim=-1)
+    else:
+        local_num_k_heads = self.num_k_heads
+        local_num_v_heads = self.num_v_heads
+        local_key_dim = self.key_dim
+        local_value_dim = self.value_dim
+
     if use_precomputed_states:
-        # 2. Convolution sequence transformation
-        # NOTE: the conv state is updated in `causal_conv1d_update`
         # Modification: keep this disabled until FLA causal_conv1d_update decode path is validated.
         raise NotImplementedError("use_precomputed_states=True is not supported yet for causal_conv1d_update now.")
     else:
         if cache_params is not None:
-            conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+            mixed_qkv_t = mixed_qkv.transpose(1, 2)
+            conv_state = F.pad(mixed_qkv_t, (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0))
             cache_params.conv_states[self.layer_idx] = conv_state
         if self.causal_conv1d_fn is not None:
-            # Modification: FLA causal_conv1d expects [B, S, D], while upstream tensor is [B, D, S].
+            # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
+            if ulysses_enabled:
+                conv_weight = self._get_local_conv1d_weight(
+                    ulysses_rank=ulysses_rank,
+                    local_key_dim=local_key_dim,
+                    local_value_dim=local_value_dim,
+                )
+            else:
+                conv_weight = self.conv1d.weight.squeeze(1)
+            # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
             mixed_qkv = self.causal_conv1d_fn(
-                x=mixed_qkv.transpose(1, 2),
-                weight=self.conv1d.weight.squeeze(1),
+                x=mixed_qkv,
+                weight=conv_weight,
                 bias=self.conv1d.bias,
                 activation=self.activation,
                 seq_idx=None,
                 backend="triton",
-                # Modification: pass varlen boundaries to FLA conv kernel.
                 cu_seqlens=cu_seq_lens_q,
-            )[0].transpose(1, 2)
+            )[0]
         else:
             raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
 
-    mixed_qkv = mixed_qkv.transpose(1, 2)
     query, key, value = torch.split(
         mixed_qkv,
         [
-            self.key_dim,
-            self.key_dim,
-            self.value_dim,
+            local_key_dim,
+            local_key_dim,
+            local_value_dim,
         ],
         dim=-1,
     )
 
-    query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-    key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-    value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+    query = query.reshape(query.shape[0], query.shape[1], local_num_k_heads, self.head_k_dim)
+    key = key.reshape(key.shape[0], key.shape[1], local_num_k_heads, self.head_k_dim)
+    value = value.reshape(value.shape[0], value.shape[1], local_num_v_heads, self.head_v_dim)
 
     beta = b.sigmoid()
     # If the model is loaded in fp16, without the .float() here, A might be -inf
-    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    # Modification: slice A_log/dt_bias for local V-heads under Ulysses SP.
+    if ulysses_enabled:
+        v_head_offset = ulysses_rank * local_num_v_heads
+        v_head_slice = slice(v_head_offset, v_head_offset + local_num_v_heads)
+        g = -self.A_log[v_head_slice].float().exp() * F.softplus(a.float() + self.dt_bias[v_head_slice])
+    else:
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
     if self.num_v_heads // self.num_k_heads > 1:
         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -291,6 +392,12 @@ def qwen3_5_gated_deltanet_forward_patched(
     # Update cache
     if cache_params is not None:
         cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+
+    # Modification: gather attention output back to sequence-sharded layout before gated norm.
+    if ulysses_enabled:
+        core_attn_out = gather_heads_scatter_seq(
+            core_attn_out, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
+        )
 
     # reshape input data into 2D tensor
     core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -359,87 +466,479 @@ def qwen3_5_decoder_layer_forward_patched(
     return hidden_states
 
 
-@config.override_method("Qwen3_5TextModel.forward", description="Support SP in Qwen3_5TextModel.forward")
-def qwen3_5_text_model_forward_patched(
+@config.override_method(
+    "Qwen3_5Model.get_image_features",
+    description="Remove unnecessary split operation to maintain contiguous memory layout.",
+)
+def qwen3_5_model_get_image_features(
+    self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None
+):
+    r"""
+    Processes images through the vision tower and returns features as a single contiguous tensor.
+
+    Optimization Note:
+    We removed the original implementation's 'split' operation that breaks vision
+    features into a list of tensors. In VeOmni, we maintain a single flattened tensor
+    to support Sequence Parallelism (SP) and FSDP2 efficiently. Keeping features
+    contiguous avoids Python list-overhead and enables direct execution of
+    vectorized kernels in the main forward pass.
+    """
+    pixel_values = pixel_values.type(self.visual.dtype)
+    vision_output: BaseModelOutputWithPooling = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True)
+    return vision_output
+
+
+@config.override_method(
+    "Qwen3_5Model.get_placeholder_mask",
+    description="Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.",
+)
+def qwen3_5_model_get_placeholder_mask(self, input_ids: torch.LongTensor, **kwargs):
+    """
+    Identifies positions of multimodal placeholder tokens (images and videos) in input_ids.
+
+    Optimization Note:
+    We simplified this method by removing 'inputs_embeds' from the argument list.
+    In VeOmni, we primarily rely on 'input_ids' and self-defined placeholder IDs
+    (e.g., IMAGE_INPUT_INDEX) instead of original Qwen token IDs. This decoupling
+    ensures that the data pipeline remains model-agnostic.
+    """
+    special_image_mask = input_ids == self.config.image_token_id
+    special_video_mask = input_ids == self.config.video_token_id
+    return special_image_mask, special_video_mask
+
+
+@config.override_method(
+    "Qwen3_5VisionModel.fast_pos_embed_interpolate",
+    description="Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.",
+)
+def qwen3_5_vision_model_fast_pos_embed_interpolate(self, grid_thw):
+    """
+    Efficient implementation adapted from vLLM's Qwen-VL optimization.
+
+    Key optimizations over standard Transformers implementation:
+    1. Computational Efficiency: Reduces bilinear interpolation multiplications from 4 to 1
+       per patch using algebraic simplification (w11=dh*dw; w10=dh-w11; w01=dw-w11; w00=1-dh-w01).
+    2. Vectorization: Uses torch.meshgrid to compute indices and weights for the entire
+       grid at once, avoiding expensive Python loops.
+
+    Original source: https://github.com/vllm-project/vllm/blob/95c0f92/vllm/model_executor/models/qwen3_vl.py#L470
+    """
+
+    num_grid_per_side = self.num_grid_per_side
+    m_size = self.spatial_merge_size
+    hidden_dim = self.pos_embed.embedding_dim
+
+    outputs = []
+    dtype = self.pos_embed.weight.dtype
+    for t, h, w in grid_thw:
+        h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
+        w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
+
+        h_floor = h_idxs.to(torch.long)
+        w_floor = w_idxs.to(torch.long)
+        h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+        w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+
+        # Create meshgrid view for all h, w vars
+        dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+        h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+        h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+        # original computation of weights
+        # w00 = (1 - dh_grid) * (1 - dw_grid)
+        # w01 = (1 - dh_grid) * dw_grid
+        # w10 = dh_grid * (1 - dw_grid)
+        # w11 = dh_grid * dw_grid
+        # we reuse w11 here to avoid duplicate
+        # dh_grid * dw_grid computation
+        w11 = dh_grid * dw_grid
+        w10 = dh_grid - w11
+        w01 = dw_grid - w11
+        w00 = 1 - dh_grid - w01
+
+        h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+        w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+        h_grid_idx = h_grid * num_grid_per_side
+
+        indices = (h_grid_idx + w_grid).reshape(4, -1)
+        weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+        weights = weights.to(dtype=dtype)
+
+        embeds = self.pos_embed(indices) * weights
+        combined = embeds[0] + embeds[1] + embeds[2] + embeds[3]
+        combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
+
+        combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+        repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+
+        outputs.append(repeated)
+
+    return torch.cat(outputs, dim=0)
+
+
+@config.override_method(
+    "Qwen3_5VisionModel.forward",
+    description="Optimized vision forward with Sequence Parallel (SP) support and padded cu_seqlens.",
+)
+def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
+    """
+    Args:
+        hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
+            The final hidden states of the model.
+        grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):
+            The temporal, height and width of feature shape of each image in LLM.
+
+    Returns:
+        `torch.Tensor`: hidden_states.
+    """
+    hidden_states = self.patch_embed(hidden_states)
+
+    pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+
+    # --- Patch.1: Sequence parallel padding and slicing for position embeddings ---
+    if get_parallel_state().sp_enabled:
+        # Note: grid_thw records the original, unpadded visual shapes. However, the data collator
+        # pads the visual sequence (hidden_states) to a multiple of (sp_size * pad_scale)
+        # to support Sequence Parallelism and subsequent spatial merging.
+        #
+        # pad_scale=4 matches the 4-to-1 spatial merge (2x2 pooling) ratio in the Qwen-VL Vision Tower.
+        # We must manually pad and slice the generated position embeddings to ensure they
+        # correctly align with the padded and sharded hidden states.
+        pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
+    # --- Patch.1 ---
+
+    hidden_states = hidden_states + pos_embeds
+
+    cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+        dim=0,
+        # Select dtype based on the following factors:
+        #  - FA2 requires that cu_seqlens_q must have dtype int32
+        #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
+        # See https://github.com/huggingface/transformers/pull/34852 for more information
+        dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+    )
+    cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+    rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+    seq_len, _ = hidden_states.size()
+    hidden_states = hidden_states.reshape(seq_len, -1)
+
+    # --- Patch.2: Flatten full-sequence rotary embeddings using the actual total sequence length ---
+    # In Sequence Parallelism, hidden_states.size(0) only represents the local shard length.
+    # We must use cu_seqlens[-1] (derived from unpadded grid_thw) to flatten the global
+    # rotary_pos_emb. This ensures the embeddings cover the entire original sequence
+    # before they are padded and sliced in Patch 3 to match the sharded hidden_states.
+    total_seq_len = cu_seqlens[-1]
+    rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
+    # --- Patch.2 ---
+
+    emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+    position_embeddings = (emb.cos(), emb.sin())
+
+    if get_parallel_state().sp_enabled:
+        # --- Patch.3: Sequence parallel padding and slicing for sin/cos rotary embeddings ---
+        cos, sin = position_embeddings
+        # Similar to Patch.1, we pad and slice the rotary embeddings to align with the
+        # padded hidden states, using pad_scale=4 to match the 4-to-1 spatial merge ratio.
+        cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
+        sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=4)
+        position_embeddings = (cos, sin)
+        # --- Patch.3 ---
+
+        # --- Patch.4: Pad cu_seqlens to align with the padded hidden_states buffer under SP ---
+        # The Data Collator pads hidden_states to a multiple of (sp_size * pad_scale),
+        # but cu_seqlens (derived from grid_thw) only covers the original unpadded sequence.
+        # We must extend cu_seqlens to cover the entire padded buffer by treating the
+        # padding region as an additional "virtual sample". This ensures that varlen
+        # kernels (like FlashAttention) process the full buffer, preventing shape
+        # mismatches or collective communication hangs during subsequent Sequence
+        # Parallel operations (e.g., All-to-All).
+        sp_size = get_parallel_state().sp_size
+        # Calculate global padding: (local_seq_len * num_ranks) - original_total_len
+        pad_seq_len = seq_len * sp_size - total_seq_len.item()
+        if pad_seq_len > 0:
+            # Append a new entry to cu_seqlens to include the padding tokens as a final segment
+            new_cumsum = cu_seqlens[-1] + pad_seq_len
+            cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+        # --- Patch.4 ---
+
+    for blk in self.blocks:
+        hidden_states = blk(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+    merged_hidden_states = self.merger(hidden_states)
+
+    return BaseModelOutputWithPooling(
+        last_hidden_state=hidden_states,
+        pooler_output=merged_hidden_states,
+    )
+
+
+@config.override_method(
+    "Qwen3_5VisionModel.dummy_forward",
+    description="Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.",
+)
+def qwen3_5_vision_model_dummy_forward(self):
+    """
+    # Run a fake ViT forward so every FSDP rank touches the vision tower.
+    # This prevents reduce-scatter hangs when some ranks have no real images/videos.
+    """
+    if get_parallel_state().sp_enabled:
+        sp_size = get_parallel_state().sp_size
+
+        # Fake patch sequence for one local rank:
+        # 16 patch tokens, each token flattened from:
+        #   3 channels * 2 temporal patches * 16 * 16 spatial patch
+        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+        # grid_thw describes the *global* pre-sharded vision grid, not the local shard.
+        # Here:
+        #   T = 1
+        #   H = 4 * sp_size
+        #   W = 4
+        # so total global patch tokens = 1 * (4 * sp_size) * 4 = 16 * sp_size.
+        grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
+        dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+    else:
+        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+        # Non-SP case: a minimal valid 4x4 patch grid.
+        # Total patch tokens = 1 * 4 * 4 = 16.
+        grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
+        dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+    return self(**dummy_data)
+
+
+@config.override_method(
+    "Qwen3_5Model.forward",
+    description=(
+        "Optimized multimodal forward supporting Ulysses SP (multimodal scattering), "
+        "FSDP-safe dummy vision processing, position_ids shape alignment, and "
+        "CPU-GPU sync avoidance via pre-computed metadata."
+    ),
+)
+def qwen3_5_model_forward(
     self,
-    input_ids: torch.LongTensor | None = None,
+    input_ids: torch.LongTensor = None,
     attention_mask: torch.Tensor | None = None,
     position_ids: torch.LongTensor | None = None,
     past_key_values: Cache | None = None,
     inputs_embeds: torch.FloatTensor | None = None,
-    use_cache: bool | None = None,
+    pixel_values: torch.Tensor | None = None,
+    pixel_values_videos: torch.FloatTensor | None = None,
+    image_grid_thw: torch.LongTensor | None = None,
+    video_grid_thw: torch.LongTensor | None = None,
+    mm_token_type_ids: torch.IntTensor | None = None,
     cache_position: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
-) -> BaseModelOutputWithPast:
+) -> tuple | Qwen3_5ModelOutputWithPast:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`, *optional*):
+        Token type IDs for multimodal inputs.
+    """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
     if inputs_embeds is None:
-        inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = self.get_input_embeddings()(input_ids)
 
-    if self.gradient_checkpointing and self.training and use_cache:
-        logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
-        use_cache = False
+    # --- Patch.1: Support Ulysses SP by using pre-computed image and video masks ---
+    # We use pre-computed masks to ensure all ranks have a consistent view of multimodal
+    # placeholder positions. If masks are not provided, we reconstruct the full sequence
+    # via all_gather to compute them locally.
+    image_mask = kwargs.get("image_mask", None)
+    video_mask = kwargs.get("video_mask", None)
 
-    if use_cache and past_key_values is None:
-        past_key_values = Qwen3_5DynamicCache(config=self.config)
+    # if None, calculate mask
+    if video_mask is None and image_mask is None:
+        if get_parallel_state().sp_enabled:
+            input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
+            dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
+            input_ids = torch.cat(input_ids_list, dim=0)
+        image_mask, video_mask = self.get_placeholder_mask(input_ids)
+    # --- Patch.1 ---
 
-    if cache_position is None:
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+    # --- Patch.4: Pop pre-computed Flash Attention kwargs to avoid ViT forward re-computation ---
+    # The LM-level flash-attention kwargs (`cu_seq_lens_q`, `cu_seq_lens_k`, `max_length_q`, `max_length_k`) are injected for packed-sequence attention. They must not reach the ViT, which computes its own `cu_seqlens`
+    flash_attn_kwargs = {}
+    for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
+        if key in kwargs:
+            flash_attn_kwargs[key] = kwargs.pop(key)
+    # --- Patch.4 ---
+
+    # --- Patch.1: Support Ulysses SP by transposing layout for multimodal scattering ---
+    if get_parallel_state().sp_enabled:
+        # Transpose from (batch, local_seq, full_hidden) to (batch, full_seq, local_hidden).
+        # This gives each rank visibility over the ENTIRE sequence length, which is
+        # necessary to scatter vision features into their correct global positions
+        # as defined by the global pre-computed masks.
+        inputs_embeds = gather_seq_scatter_heads(
+            inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
+        )
+    # --- Patch.1 ---
+
+    if pixel_values is not None:
+        image_outputs: BaseModelOutputWithPooling = self.get_image_features(
+            pixel_values, image_grid_thw, return_dict=True
+        )
+        image_embeds = image_outputs.pooler_output
+
+        # --- Patch.1: Shard image_embeds for sequence parallel scatter ---
+        if get_parallel_state().sp_enabled:
+            # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
+            image_embeds = gather_seq_scatter_heads(
+                image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+            )
+        n_image_tokens = image_mask.sum().long().item()
+        embeds_image_mask = (
+            image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+        )
+        # Slice tensor to drop any padded image tokens
+        image_embeds = image_embeds[:n_image_tokens]
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
+
+        # sequence parallel patch for image_mask & deepstack_image_embeds
+        if get_parallel_state().sp_enabled:
+            seq_len = image_mask.shape[1]
+
+            seq_per_rank = seq_len // get_parallel_state().sp_size
+            rank_start = get_parallel_state().sp_rank * seq_per_rank
+            rank_end = rank_start + seq_per_rank
+
+            image_mask = image_mask[:, rank_start:rank_end]
+        # --- Patch.1 ---
+    elif get_parallel_state().fsdp_enabled:
+        # --- Patch.2: Dummy forward to prevent FSDP reduce-scatter hang on uneven multimodal batches ---
+        # add dummy ViT forward to avoid FSDP reduce-scatter hang
+        # when some ranks get None pixel_values while others get valid pixel_values
+        vision_output = self.visual.dummy_forward()
+        fake_embeds = vision_output.pooler_output
+        fake_embeds = fake_embeds.mean() * 0.0
+        fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds + fake_embeds
+        # --- Patch.2 ---
+
+    if pixel_values_videos is not None:
+        video_outputs: BaseModelOutputWithPooling = self.get_video_features(
+            pixel_values_videos, video_grid_thw, return_dict=True
+        )
+        video_embeds = video_outputs.pooler_output
+
+        # --- Patch.1: Shard video_embeds for sequence parallel scatter ---
+        # sequence parallel patch for video embeds
+        if get_parallel_state().sp_enabled:
+            # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
+            video_embeds = gather_seq_scatter_heads(
+                video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+            )
+        n_video_tokens = video_mask.sum().long().item()
+        embeds_video_mask = (
+            video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
         )
 
-    # mrope: the hard coded `3` is for temporal, height and width.
+        # Slice tensor to drop any padded video tokens
+        video_embeds = video_embeds[:n_video_tokens]
+        video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
+
+        # sequence parallel patch for video_mask & deepstack_video_embeds
+        if get_parallel_state().sp_enabled:
+            seq_len = video_mask.shape[1]
+
+            seq_per_rank = seq_len // get_parallel_state().sp_size
+            rank_start = get_parallel_state().sp_rank * seq_per_rank
+            rank_end = rank_start + seq_per_rank
+
+            video_mask = video_mask[:, rank_start:rank_end]
+        # --- Patch.1 ---
+    elif get_parallel_state().fsdp_enabled:
+        # --- Patch.2: Dummy forward for video encoder to avoid FSDP hang ---
+        # add dummy ViT forward to avoid FSDP reduce-scatter hang
+        # when some ranks get None pixel_values_videos while others get valid pixel_values_videos
+        vision_output = self.visual.dummy_forward()
+        fake_embeds = vision_output.pooler_output
+        fake_embeds = fake_embeds.mean() * 0.0
+        fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds + fake_embeds
+        # --- Patch.2 ---
+
+    # --- Patch.1: Final transpose back to standard sequence-sharded layout ---
+    if get_parallel_state().sp_enabled:
+        # Restore the layout to (batch, local_seq, full_hidden) for subsequent
+        # transformer layers, which expect standard Sequence Parallel sharding.
+        inputs_embeds = gather_heads_scatter_seq(
+            inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
+        )
+    # --- Patch.1 ---
+
     if position_ids is None:
-        position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
-    elif position_ids.ndim == 2:
-        position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-
-    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-        text_position_ids = position_ids[0]
-        position_ids = position_ids[1:]
-    else:
-        text_position_ids = position_ids[0]
-
-    causal_mask = create_causal_mask(
-        config=self.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        cache_position=cache_position,
-        past_key_values=past_key_values,
-        position_ids=text_position_ids,
-    )
-    linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
-
-    hidden_states = inputs_embeds
-    position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-    # ============================== VeOmni SP Patch Start ==============================
-    sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-    position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
-    # =============================== VeOmni SP Patch End ===============================
-
-    for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-        layer_mask = linear_attn_mask if decoder_layer.layer_type == "linear_attention" else causal_mask
-
-        hidden_states = decoder_layer(
-            hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=layer_mask,
-            position_ids=position_ids,
+        position_ids = self.compute_3d_position_ids(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
+            mm_token_type_ids=mm_token_type_ids,
         )
+    else:
+        # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---
+        # When position_ids are pre-computed during data preprocessing (for varlen/packed data),
+        # they are typically collated into (batch_size, 3, seq_len) shape. We transpose them
+        # to (3, batch_size, seq_len) to match the internal requirements of the language model.
+        if position_ids.dim() == 3 and position_ids.shape[1] == 3:
+            position_ids = position_ids.transpose(0, 1).contiguous()
+        # --- Patch.3 ---
 
-    hidden_states = self.norm(hidden_states)
+    # --- Patch.4: Restore pre-computed Flash Attention kwargs for language model ---
+    kwargs.update(flash_attn_kwargs)
+    # --- Patch.4 ---
+
+    outputs = self.language_model(
+        input_ids=None,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        cache_position=cache_position,
+        **kwargs,
+    )
 
     return Qwen3_5ModelOutputWithPast(
-        last_hidden_state=hidden_states,
-        past_key_values=past_key_values,
+        **outputs,
+        rope_deltas=self.rope_deltas,
     )
+
+
+config.add_post_import_block("""
+def get_position_id(main_func, self, **kwargs):
+    # Must be a module-level function for multiprocessing pickle
+    position_ids, rope_deltas = main_func(self, **kwargs)
+    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+""")
+
+
+@config.override_method(
+    "Qwen3_5ForConditionalGeneration.get_position_id_func",
+    description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
+)
+def qwen3_5_forconditional_generation_get_position_id_func(self):
+    fake_config = copy(self.config)
+    fake_config.image_token_id = IMAGE_INPUT_INDEX
+    fake_config.video_token_id = VIDEO_INPUT_INDEX
+    fake_model = SimpleNamespace(config=fake_config)
+    return partial(get_position_id, Qwen3_5Model.get_rope_index, fake_model)  # noqa: F821 already defined via above `add_post_import_block`
 
 
 @config.override_method(
@@ -462,14 +961,6 @@ def qwen3_5_forconditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5CausalLMOutputWithPast:
-    # Modification: VeOmni currently supports text-only Qwen3_5.
-    # TODO(veomni): add vision input support for pixel_values/pixel_values_videos.
-    if pixel_values is not None or pixel_values_videos is not None:
-        raise ValueError(
-            "Qwen3_5ForConditionalGeneration currently supports text-only inputs in VeOmni; "
-            "`pixel_values` and `pixel_values_videos` are not supported yet."
-        )
-
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,

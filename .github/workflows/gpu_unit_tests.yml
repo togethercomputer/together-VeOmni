@@ -70,6 +70,16 @@ jobs:
       - name: Sync dependencies
         run: |
           uv sync --frozen --extra gpu --extra audio --group dev
+      - name: Detect changed paths for conditional tests
+        id: changes
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before || 'HEAD~1' }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA" HEAD -- || true)
+          if echo "$CHANGED" | grep -qE '(veomni/distributed/sequence_parallel/|veomni/models/transformers/qwen3_5/)'; then
+            echo "qwen3_5_ulysses=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "qwen3_5_ulysses=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Run parallel tests
         # TODO: run all tests under tests/parallel/ulysses after we verify
         #       tests/parallel/ulysses/test_ulysses_async.py still works
@@ -84,9 +94,9 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
-      - name: Run fsdp2/ep+fsdp2 clip grad norm test
+      - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
-          uv run --frozen pytest -s -x tests/utils/test_ep_clip_grad_norm.py
+          uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
@@ -100,9 +110,20 @@ jobs:
         run: |
           uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
       - name: Run models tests [transformers-v5]
+        # TODO: Run the following tests with proper `--no-group transformers-stable --extra transformers5-exp` to enable transformers v5.
+        # Currently those tests are effectively skipped (but it's not straightforward to enable due to L20 OOM).
         run: |
           uv run  --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
+      - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
+        if: steps.changes.outputs.qwen3_5_ulysses == 'true'
+        run: |
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
+      - name: Run utils tests [transformers-v5]
+        # TODO: run all tests under tests/utils/ once all util tests are verified
+        run: |
+          # Need v5 to support newer models like Qwen3.5 count flops tests.
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/utils/test_count_flops.py
       # TODO: Run other tests in transformers v5 env as well.
 
   cleanup:
