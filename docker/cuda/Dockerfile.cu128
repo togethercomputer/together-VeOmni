@@ -30,7 +30,9 @@ RUN echo "Setting timezone to CST (China Standard Time)..." && \
 # Install apt packages.
 RUN apt-get update -y \
     && apt-get install -y sudo ffmpeg curl wget vim \
-    && apt-get clean
+    && apt-get install -y --no-install-recommends --only-upgrade ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Add tiger user, remove default user
 RUN userdel -r $(id -un 1000) 2>/dev/null || true && \
