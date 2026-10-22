@@ -1,6 +1,12 @@
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-03.html
 from nvcr.io/nvidia/pytorch:25.03-py3
 
+# CVE-2026-111943: upgrade the OS CA trust store from the distro security repo and fail if still vulnerable
+RUN apt-get update && apt-get install -y --no-install-recommends --only-upgrade ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    v="$(dpkg-query -W -f='${Version}' ca-certificates)" && \
+    dpkg --compare-versions "$v" ge "20260816~" || { echo "ca-certificates $v is older than 20260816 (CVE-2026-111943)"; exit 1; }
+
 # Define environments
 ENV MAX_JOBS=16
 ENV DEBIAN_FRONTEND=noninteractive
