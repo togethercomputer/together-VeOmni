@@ -19,15 +19,15 @@ authors = [
 
 dependencies = [
   "blobfile>=3.0.0",
-  "datasets>=2.16.0,<=2.21.0",
-  "packaging>=23.0,<26.0",
+  "datasets>=5.0.1",
+  "packaging>=23.0,<27.0",
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
-  "diffusers>=0.30.0,<=0.31.0",
+  "diffusers>=0.38.0",
   # Comment out transformers version for pip user compatibility (not to accidentally install v5 which is still WIP
   # and experimental)
   # For uv user: The actual version is controlled by the "transformers-stable" default
-  # dependency-group (==4.57.3) or by the "transformers5-exp" optional extra (==5.2.0).
+  # dependency-group (==4.57.3) or by the "transformers5-exp" optional extra (==5.9.0).
   # For pip user: please install 4.57.3 manually via pip install transformers==4.57.3.
   # "transformers==4.57.3",
   "psutil",
@@ -58,7 +58,7 @@ video = [
   "soundfile>=0.13.1,<0.14"
 ]
 dit = [
-  "diffusers>=0.30.0,<=0.31.0",
+  "diffusers>=0.38.0",
   "bitsandbytes>=0.46.0,<=0.47.0"
 ]
 npu_aarch64 = [
@@ -111,7 +111,7 @@ fa4 = [
 # See https://github.com/ByteDance-Seed/VeOmni/issues/468 for the progress.
 # Usage: `uv sync --no-group transformers-stable --extra transformers5-exp --extra <other extra>`.
 transformers5-exp = [
-  "transformers==5.2.0"
+  "transformers==5.9.0"
 ]
 
 [dependency-groups]
@@ -153,7 +153,7 @@ transformers-stable = [
 # NOTE 1: Update this at least once per month as uv releases new version every week.
 # NOTE 2: When updating this line, make sure to update Dockerfile under docker/ to the same
 #         version and release new docker images.
-required-version = "==0.9.8"
+required-version = "==0.13.4"
 no-build-isolation-package = [
     "flash-attn",
     "flash-attn-3",
@@ -164,6 +164,11 @@ no-build-isolation-package = [
 # To use transformers 5, run:
 #   uv sync --no-group transformers-stable --extra transformers5-exp
 default-groups = ["transformers-stable"]
+
+# Security floors for transitive dependencies (CVE fixes).
+constraint-dependencies = [
+    "virtualenv>=21.14.9",
+]
 
 override-dependencies = [
     # Adding the (extra == 'gpu') mark to declare this override is only for gpu extra.

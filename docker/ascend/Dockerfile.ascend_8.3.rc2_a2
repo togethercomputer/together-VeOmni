@@ -3,6 +3,12 @@
 # git repo: https://gitcode.com/Ascend/pytorch
 FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.3.rc2-910b-ubuntu22.04-py3.11
 
+# CVE-2026-111943: upgrade the OS CA trust store from the distro security repo and fail if still vulnerable
+RUN apt-get update && apt-get install -y --no-install-recommends --only-upgrade ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    v="$(dpkg-query -W -f='${Version}' ca-certificates)" && \
+    dpkg --compare-versions "$v" ge "20260816~" || { echo "ca-certificates $v is older than 20260816 (CVE-2026-111943)"; exit 1; }
+
 # Define environments
 ENV MAX_JOBS=16
 ENV DEBIAN_FRONTEND=noninteractive
@@ -53,7 +59,7 @@ RUN pip config set global.index-url "${PIP_INDEX}" && \
 # Upgrade pip
 RUN pip3 install --no-cache-dir -U pip setuptools requests
 
-COPY --from=ghcr.io/astral-sh/uv:0.9.8 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /uvx /bin/
 ENV PATH="/bin/:$PATH"
 
 # uv sync
